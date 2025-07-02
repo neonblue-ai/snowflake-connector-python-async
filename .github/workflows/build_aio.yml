@@ -1,0 +1,59 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - aio
+    tags:
+      - v*
+
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os:
+          - image: ubuntu-latest
+            id: manylinux_x86_64
+          - image: ubuntu-latest
+            id: manylinux_aarch64
+          - image: windows-latest
+            id: win_amd64
+          - image: macos-latest
+            id: macosx_x86_64
+          - image: macos-latest
+            id: macosx_arm64
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    name: Build ${{ matrix.os.id }}-py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os.image }}
+    steps:
+      - name: Set shortver
+        run: echo "shortver=${longver//./}" >> $GITHUB_ENV
+        env:
+          longver: ${{ matrix.python-version }}
+        shell: bash
+      - name: Set up QEMU
+        if: ${{ matrix.os.id == 'manylinux_aarch64' }}
+        uses: docker/setup-qemu-action@v2
+        with:
+          image: tonistiigi/binfmt:qemu-v8.1.5
+          platforms: all
+      - uses: actions/checkout@v4
+      - name: Building wheel
+        uses: pypa/cibuildwheel@v2.21.3
+        env:
+          CIBW_BUILD: cp${{ env.shortver }}-${{ matrix.os.id }}
+          MACOSX_DEPLOYMENT_TARGET: 10.14
+        with:
+          output-dir: dist
+      - name: Show wheels generated
+        run: ls -lh dist
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          include-hidden-files: true
+          name: ${{ matrix.os.id }}_py${{ matrix.python-version }}
+          path: dist/
