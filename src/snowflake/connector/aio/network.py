@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import json
 import uuid
+from logging import getLogger
 from typing import Any, Optional
 from urllib.parse import urlencode
+
+logger = getLogger(__name__)
 
 try:
     import aiohttp
@@ -27,6 +30,12 @@ from ..constants import (
     HTTP_HEADER_CONTENT_TYPE,
     HTTP_HEADER_USER_AGENT,
 )
+from ..errors import (
+    Error,
+    ProgrammingError,
+    DatabaseError,
+    InterfaceError,
+)
 from ..network import (
     SnowflakeRestfulJsonEncoder, 
     KEY_PAIR_AUTHENTICATOR,
@@ -34,8 +43,11 @@ from ..network import (
     PYTHON_CONNECTOR_USER_AGENT,
     REQUEST_ID,
     ACCEPT_TYPE_APPLICATION_SNOWFLAKE,
+    is_retryable_http_code,
+    get_http_retryable_error,
 )
 from .auth import AsyncAuthByDefault, AsyncAuthByKeyPair
+from .retry import AsyncRetryableOperation
 
 
 class AsyncSnowflakeRestful:
@@ -257,21 +269,106 @@ class AsyncSnowflakeRestful:
         if timeout is None:
             timeout = self._sync_connection.network_timeout
             
-        async with self._session.post(
-            url,
-            json=data,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=timeout)
-        ) as response:
-            response.raise_for_status()
-            result = await response.json()
-            
-            # Process result using sync connection logic if needed
-            if not result.get("success"):
-                raise Exception(f"Query failed: {result.get('message', 'Unknown error')}")
+        # Create retryable operation for query execution
+        async def execute_query():
+            async with self._session.post(
+                url,
+                json=data,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as response:
+                # Check for retryable HTTP errors
+                if is_retryable_http_code(response.status):
+                    error = get_http_retryable_error(response.status)
+                    raise error
+                    
+                response.raise_for_status()
+                result = await response.json()
                 
-            return result
+                # Process result using sync connection logic if needed
+                if not result.get("success"):
+                    error_code = result.get("code", -1)
+                    error_message = result.get("message", "Unknown error")
+                    
+                    # Use sync error handling logic for consistency
+                    error_data = {
+                        "msg": error_message,
+                        "errno": error_code,
+                        "sqlstate": result.get("sqlstate"),
+                    }
+                    
+                    # Raise appropriate exception type based on error
+                    if error_code >= 600000:  # Internal errors
+                        raise InterfaceError(error_data)
+                    elif error_code >= 400000:  # Client errors  
+                        raise ProgrammingError(error_data)
+                    else:  # General database errors
+                        raise DatabaseError(error_data)
+                    
+                return result
+        
+        # Execute with retry logic
+        retry_operation = AsyncRetryableOperation(
+            execute_query,
+            max_retries=3,
+            timeout=timeout,
+            backoff_policy="exponential"
+        )
+        
+        return await retry_operation.execute()
             
+    async def _heartbeat(self) -> dict[str, Any]:
+        """
+        Perform async heartbeat request to keep session alive.
+        
+        Async version of: SnowflakeRestful._heartbeat()
+        
+        Reuses sync heartbeat business logic but uses aiohttp for transport.
+        
+        Returns:
+            Heartbeat response from server
+        """
+        if not self._session:
+            raise RuntimeError("Not authenticated. Call authenticate() first.")
+            
+        # Build heartbeat request following sync implementation
+        headers = {
+            HTTP_HEADER_CONTENT_TYPE: CONTENT_TYPE_APPLICATION_JSON,
+            HTTP_HEADER_ACCEPT: CONTENT_TYPE_APPLICATION_JSON,
+            HTTP_HEADER_USER_AGENT: PYTHON_CONNECTOR_USER_AGENT,
+            "Authorization": f"Snowflake Token=\"{self._sync_connection._token}\"",
+        }
+        
+        # Add service name header if configured
+        if self._sync_connection.service_name:
+            from ..network import HTTP_HEADER_SERVICE_NAME
+            headers[HTTP_HEADER_SERVICE_NAME] = self._sync_connection.service_name
+            
+        request_id = str(uuid.uuid4())
+        logger.debug("heartbeat request_id: %s", request_id)
+        
+        # Build heartbeat URL following sync pattern
+        url = f"{self._base_url}/session/heartbeat?" + urlencode({REQUEST_ID: request_id})
+        
+        try:
+            async with self._session.post(
+                url,
+                headers=headers,
+                json=None  # Heartbeat has no body
+            ) as response:
+                response.raise_for_status()
+                result = await response.json()
+                
+                # Log errors following sync pattern
+                if not result.get("success"):
+                    logger.error("Failed to heartbeat. code: %s, url: %s", result.get("code"), url)
+                    
+                return result
+                
+        except Exception as e:
+            logger.error("Heartbeat request failed: %s", e)
+            return {"success": False, "message": str(e)}
+
     async def close(self) -> None:
         """Close async HTTP session."""
         if self._session:

@@ -36,35 +36,29 @@ class SnowflakeBenchmark:
         
         # Base connection parameters
         self.conn_params = {
-            'user': os.getenv('SNOWFLAKE_USERNAME') or os.getenv('SNOWFLAKE_USER'),
+            'user': os.getenv('SNOWFLAKE_USER'),
             'account': os.getenv('SNOWFLAKE_ACCOUNT'),
             'database': os.getenv('SNOWFLAKE_DATABASE'),
             'schema': os.getenv('SNOWFLAKE_SCHEMA'),
             'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE'),
-            'application': os.getenv('SNOWFLAKE_APPLICATION', 'snowflake-benchmark'),
         }
         
         # Authentication - prefer private key over password
-        private_key = os.getenv('SNOWFLAKE_PRIVATE_KEY')
+        private_key_raw = os.getenv('SNOWFLAKE_PRIVATE_KEY_RAW')
         private_key_path = os.getenv('SNOWFLAKE_PRIVATE_KEY_PATH')
-        private_key_pass = os.getenv('SNOWFLAKE_PRIVATE_KEY_PASS')
         password = os.getenv('SNOWFLAKE_PASSWORD')
         
-        if private_key:
+        if private_key_raw:
             # Use private key from environment variable
-            self.conn_params['private_key'] = private_key
-            if private_key_pass:
-                self.conn_params['private_key_file_pwd'] = private_key_pass
+            self.conn_params['private_key'] = private_key_raw
         elif private_key_path:
             # Use private key from file
             self.conn_params['private_key_file'] = private_key_path
-            if private_key_pass:
-                self.conn_params['private_key_file_pwd'] = private_key_pass
         elif password:
             # Fall back to password authentication
             self.conn_params['password'] = password
         else:
-            raise ValueError("Must provide either SNOWFLAKE_PRIVATE_KEY, SNOWFLAKE_PRIVATE_KEY_PATH, or SNOWFLAKE_PASSWORD")
+            raise ValueError("Must provide either SNOWFLAKE_PRIVATE_KEY_RAW, SNOWFLAKE_PRIVATE_KEY_PATH, or SNOWFLAKE_PASSWORD")
         
         # Validate required parameters
         required = ['user', 'account', 'database', 'schema', 'warehouse']

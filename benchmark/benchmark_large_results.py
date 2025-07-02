@@ -38,28 +38,22 @@ class LargeResultBenchmark:
         
         # Connection parameters
         self.conn_params = {
-            'user': os.getenv('SNOWFLAKE_USERNAME'),
+            'user': os.getenv('SNOWFLAKE_USER'),
             'account': os.getenv('SNOWFLAKE_ACCOUNT'),
             'database': os.getenv('SNOWFLAKE_DATABASE'),
             'schema': os.getenv('SNOWFLAKE_SCHEMA'),
             'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE'),
-            'application': os.getenv('SNOWFLAKE_APPLICATION', 'large-result-benchmark'),
         }
         
         # Add authentication
         private_key_path = os.getenv('SNOWFLAKE_PRIVATE_KEY_PATH')
-        private_key_pass = os.getenv('SNOWFLAKE_PRIVATE_KEY_PASS')
-        private_key = os.getenv('SNOWFLAKE_PRIVATE_KEY')
+        private_key_raw = os.getenv('SNOWFLAKE_PRIVATE_KEY_RAW')
         password = os.getenv('SNOWFLAKE_PASSWORD')
         
         if private_key_path and os.path.exists(private_key_path):
             self.conn_params['private_key_file'] = private_key_path
-            if private_key_pass:
-                self.conn_params['private_key_file_pwd'] = private_key_pass
-        elif private_key:
-            self.conn_params['private_key'] = private_key
-            if private_key_pass:
-                self.conn_params['private_key_file_pwd'] = private_key_pass
+        elif private_key_raw:
+            self.conn_params['private_key'] = private_key_raw
         elif password:
             self.conn_params['password'] = password
         else:

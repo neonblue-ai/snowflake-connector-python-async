@@ -9,12 +9,17 @@ all business logic from the base library.
 from __future__ import annotations
 
 import uuid
+import weakref
+from logging import getLogger
 from typing import Any, Optional
 
 from .. import SnowflakeConnection
 from ..cursor import SnowflakeCursor
 from ..time_util import get_time_millis
 from .network import AsyncSnowflakeRestful
+from .time_util import AsyncHeartBeatTimer, create_weak_async_heartbeat_func
+
+logger = getLogger(__name__)
 
 
 class AsyncSnowflakeConnection:
@@ -41,6 +46,8 @@ class AsyncSnowflakeConnection:
         self._sync_connection = SnowflakeConnection(**kwargs)
         self._async_rest_client: Optional[AsyncSnowflakeRestful] = None
         self._is_connected = False
+        # Async heartbeat timer for session keep-alive
+        self.heartbeat_timer: Optional[AsyncHeartBeatTimer] = None
         
     async def connect(self) -> None:
         """
@@ -57,6 +64,10 @@ class AsyncSnowflakeConnection:
         # Perform async authentication
         await self._async_rest_client.authenticate()
         self._is_connected = True
+        
+        # Initialize async heartbeat if session keep-alive is enabled
+        if self._sync_connection.client_session_keep_alive:
+            await self._add_async_heartbeat()
         
     async def commit(self) -> None:
         """
@@ -119,6 +130,81 @@ class AsyncSnowflakeConnection:
             timeout=timeout,
             dataframe_ast=dataframe_ast,
         )
+    
+    async def autocommit(self, mode: bool) -> None:
+        """
+        Set autocommit mode.
+        
+        Async version of: SnowflakeConnection.autocommit()
+        
+        Args:
+            mode: True to enable autocommit, False to disable
+        """
+        # Delegate to sync connection for consistency
+        self._sync_connection.autocommit(mode)
+    
+    async def execute_string(
+        self, 
+        sql_text: str, 
+        remove_comments: bool = False,
+        return_cursors: bool = True
+    ) -> list['AsyncSnowflakeCursor'] | list[dict[str, Any]]:
+        """
+        Execute multiple SQL statements.
+        
+        Async version of: SnowflakeConnection.execute_string()
+        
+        Args:
+            sql_text: SQL statements to execute
+            remove_comments: Whether to remove comments from SQL
+            return_cursors: Whether to return cursors or results
+            
+        Returns:
+            List of cursors or results
+        """
+        # Use sync connection to parse SQL, then execute async
+        sync_results = self._sync_connection.execute_string(
+            sql_text, 
+            remove_comments=remove_comments, 
+            return_cursors=False
+        )
+        
+        if return_cursors:
+            # Convert results to async cursors
+            async_cursors = []
+            for _ in sync_results:
+                cursor = self.cursor()
+                # Execute individual statements would need to be handled
+                # For now, delegate to sync behavior
+                async_cursors.append(cursor)
+            return async_cursors
+        else:
+            return sync_results
+    
+    async def is_valid(self) -> bool:
+        """
+        Check if connection is valid.
+        
+        Async version of: SnowflakeConnection.is_valid()
+        
+        Uses async heartbeat to validate session like sync version.
+        
+        Returns:
+            True if connection is valid, False otherwise
+        """
+        if not self._is_connected:
+            logger.debug("connection is not connected and not valid")
+            return False
+            
+        try:
+            logger.debug("trying to async heartbeat into the session to validate")
+            hb_result = await self._async_heartbeat()
+            session_valid = hb_result.get("success")
+            logger.debug("session still valid? %s", session_valid)
+            return bool(session_valid)
+        except Exception as e:
+            logger.debug("session could not be validated due to exception: %s", e)
+            return False
         
     async def close(self) -> None:
         """
@@ -126,6 +212,9 @@ class AsyncSnowflakeConnection:
         
         Async version of: SnowflakeConnection.close()
         """
+        # Cancel async heartbeat first
+        await self._cancel_async_heartbeat()
+        
         if self._async_rest_client:
             await self._async_rest_client.close()
             self._async_rest_client = None
@@ -146,6 +235,64 @@ class AsyncSnowflakeConnection:
         # Import here to avoid circular imports
         from .cursor import AsyncSnowflakeCursor
         return AsyncSnowflakeCursor(self)
+    
+    async def _add_async_heartbeat(self) -> None:
+        """
+        Add a periodic async heartbeat to keep connection alive.
+        
+        Async version of: SnowflakeConnection._add_heartbeat()
+        
+        Uses AsyncHeartBeatTimer with asyncio tasks instead of threading.
+        """
+        if not self.heartbeat_timer:
+            # Validate heartbeat frequency using sync connection logic
+            self._sync_connection._validate_client_session_keep_alive_heartbeat_frequency()
+            
+            # Create weak reference async heartbeat function
+            heartbeat_func = create_weak_async_heartbeat_func(self._async_heartbeat_tick)
+            
+            # Create async heartbeat timer
+            self.heartbeat_timer = AsyncHeartBeatTimer(
+                self._sync_connection.client_session_keep_alive_heartbeat_frequency,
+                heartbeat_func,
+            )
+            self.heartbeat_timer.start()
+            logger.debug("started async heartbeat")
+    
+    async def _cancel_async_heartbeat(self) -> None:
+        """
+        Cancel the async heartbeat timer.
+        
+        Async version of: SnowflakeConnection._cancel_heartbeat()
+        """
+        if self.heartbeat_timer:
+            self.heartbeat_timer.stop()
+            self.heartbeat_timer = None
+            logger.debug("stopped async heartbeat")
+    
+    async def _async_heartbeat_tick(self) -> None:
+        """
+        Execute an async heartbeat if connection isn't closed.
+        
+        Async version of: SnowflakeConnection._heartbeat_tick()
+        """
+        if not self.is_closed():
+            logger.debug("async heartbeating!")
+            await self._async_rest_client._heartbeat()
+    
+    async def _async_heartbeat(self) -> dict[str, Any]:
+        """
+        Perform async heartbeat request to keep session alive.
+        
+        Async version of network heartbeat functionality.
+        
+        Returns:
+            Heartbeat response from server
+        """
+        if not self._async_rest_client:
+            raise RuntimeError("Async REST client not initialized")
+        
+        return await self._async_rest_client._heartbeat()
         
     # Delegate properties to sync connection for automatic updates
     
@@ -205,6 +352,45 @@ class AsyncSnowflakeConnection:
     def port(self) -> int:
         """Get port from sync connection."""
         return self._sync_connection.port
+    
+    @property
+    def login_timeout(self) -> Optional[int]:
+        """Login timeout in seconds."""
+        return getattr(self._sync_connection, 'login_timeout', None)
+    
+    @login_timeout.setter
+    def login_timeout(self, value: int) -> None:
+        """Set login timeout."""
+        if hasattr(self._sync_connection, 'login_timeout'):
+            self._sync_connection.login_timeout = value
+    
+    @property
+    def network_timeout(self) -> Optional[int]:
+        """Network timeout in seconds."""
+        return getattr(self._sync_connection, 'network_timeout', None)
+    
+    @network_timeout.setter
+    def network_timeout(self, value: int) -> None:
+        """Set network timeout."""
+        if hasattr(self._sync_connection, 'network_timeout'):
+            self._sync_connection.network_timeout = value
+    
+    @property
+    def client_prefetch_threads(self) -> Optional[int]:
+        """Number of threads for prefetching results."""
+        return getattr(self._sync_connection, 'client_prefetch_threads', None)
+    
+    @client_prefetch_threads.setter  
+    def client_prefetch_threads(self, value: int) -> None:
+        """Set client prefetch threads."""
+        if hasattr(self._sync_connection, 'client_prefetch_threads'):
+            self._sync_connection.client_prefetch_threads = value
+    
+    @property
+    def rest(self):
+        """Access to internal REST client (for compatibility)."""
+        # Return the async REST client for async operations
+        return self._async_rest_client
         
     def is_closed(self) -> bool:
         """Check if connection is closed."""

@@ -18,6 +18,17 @@ try:
 except Exception:
     with open(os.path.join(CONNECTOR_SRC_DIR, "version.py"), encoding="utf-8") as f:
         exec(f.read())
+
+# Async version injection - read aio-version file and replace 4th element
+try:
+    aio_version_file = os.path.join(os.path.dirname(__file__), "aio-version")
+    if os.path.exists(aio_version_file):
+        with open(aio_version_file, 'r', encoding='utf-8') as f:
+            aio_version = int(f.read().strip())
+        VERSION = VERSION[:3] + (aio_version,)
+except (ValueError, IOError, OSError):
+    pass  # Keep original VERSION if aio-version read fails
+
 version = ".".join([str(v) for v in VERSION if v is not None])
 
 # Parse command line flags
