@@ -28,5 +28,5 @@ TAG="v$NEW_TAG"
 git tag -a "$TAG" -m "Release $TAG"
 
 echo "Version bumped to $NEW_TAG and tagged as $TAG"
-echo "To push: git push origin aio && git push origin $TAG"
+git push origin aio && git push origin $TAG
 
