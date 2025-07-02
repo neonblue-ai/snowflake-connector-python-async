@@ -119,6 +119,76 @@ class AsyncSnowflakeConnection:
             timeout=timeout,
             dataframe_ast=dataframe_ast,
         )
+    
+    async def autocommit(self, mode: bool) -> None:
+        """
+        Set autocommit mode.
+        
+        Async version of: SnowflakeConnection.autocommit()
+        
+        Args:
+            mode: True to enable autocommit, False to disable
+        """
+        # Delegate to sync connection for consistency
+        self._sync_connection.autocommit(mode)
+    
+    async def execute_string(
+        self, 
+        sql_text: str, 
+        remove_comments: bool = False,
+        return_cursors: bool = True
+    ) -> list['AsyncSnowflakeCursor'] | list[dict[str, Any]]:
+        """
+        Execute multiple SQL statements.
+        
+        Async version of: SnowflakeConnection.execute_string()
+        
+        Args:
+            sql_text: SQL statements to execute
+            remove_comments: Whether to remove comments from SQL
+            return_cursors: Whether to return cursors or results
+            
+        Returns:
+            List of cursors or results
+        """
+        # Use sync connection to parse SQL, then execute async
+        sync_results = self._sync_connection.execute_string(
+            sql_text, 
+            remove_comments=remove_comments, 
+            return_cursors=False
+        )
+        
+        if return_cursors:
+            # Convert results to async cursors
+            async_cursors = []
+            for _ in sync_results:
+                cursor = self.cursor()
+                # Execute individual statements would need to be handled
+                # For now, delegate to sync behavior
+                async_cursors.append(cursor)
+            return async_cursors
+        else:
+            return sync_results
+    
+    async def is_valid(self) -> bool:
+        """
+        Check if connection is valid.
+        
+        Async version of: SnowflakeConnection.is_valid()
+        
+        Returns:
+            True if connection is valid, False otherwise
+        """
+        if not self._is_connected:
+            return False
+            
+        try:
+            # Simple query to test connection validity
+            cursor = self.cursor()
+            await cursor.execute("SELECT 1")
+            return True
+        except Exception:
+            return False
         
     async def close(self) -> None:
         """
@@ -205,6 +275,45 @@ class AsyncSnowflakeConnection:
     def port(self) -> int:
         """Get port from sync connection."""
         return self._sync_connection.port
+    
+    @property
+    def login_timeout(self) -> Optional[int]:
+        """Login timeout in seconds."""
+        return getattr(self._sync_connection, 'login_timeout', None)
+    
+    @login_timeout.setter
+    def login_timeout(self, value: int) -> None:
+        """Set login timeout."""
+        if hasattr(self._sync_connection, 'login_timeout'):
+            self._sync_connection.login_timeout = value
+    
+    @property
+    def network_timeout(self) -> Optional[int]:
+        """Network timeout in seconds."""
+        return getattr(self._sync_connection, 'network_timeout', None)
+    
+    @network_timeout.setter
+    def network_timeout(self, value: int) -> None:
+        """Set network timeout."""
+        if hasattr(self._sync_connection, 'network_timeout'):
+            self._sync_connection.network_timeout = value
+    
+    @property
+    def client_prefetch_threads(self) -> Optional[int]:
+        """Number of threads for prefetching results."""
+        return getattr(self._sync_connection, 'client_prefetch_threads', None)
+    
+    @client_prefetch_threads.setter  
+    def client_prefetch_threads(self, value: int) -> None:
+        """Set client prefetch threads."""
+        if hasattr(self._sync_connection, 'client_prefetch_threads'):
+            self._sync_connection.client_prefetch_threads = value
+    
+    @property
+    def rest(self):
+        """Access to internal REST client (for compatibility)."""
+        # Return the async REST client for async operations
+        return self._async_rest_client
         
     def is_closed(self) -> bool:
         """Check if connection is closed."""

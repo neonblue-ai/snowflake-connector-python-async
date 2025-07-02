@@ -385,6 +385,109 @@ class AsyncSnowflakeCursor:
         
         return all_rows
         
+    async def executemany(self, query: str, seq_of_parameters: list[dict]) -> None:
+        """
+        Execute a query with multiple parameter sets.
+        
+        Async version of: SnowflakeCursor.executemany()
+        
+        Args:
+            query: SQL query string
+            seq_of_parameters: Sequence of parameter dictionaries
+        """
+        if self._is_closed:
+            raise RuntimeError("Cursor is closed")
+            
+        # Execute each parameter set sequentially using async execute
+        for parameters in seq_of_parameters:
+            await self.execute(query, parameters)
+    
+    async def callproc(self, procname: str, args: tuple = tuple()) -> tuple:
+        """
+        Call a stored procedure.
+        
+        Async version of: SnowflakeCursor.callproc()
+        
+        Args:
+            procname: Name of the stored procedure
+            args: Arguments to pass to the procedure
+            
+        Returns:
+            Modified arguments (DB-API 2.0 compliance)
+        """
+        if self._is_closed:
+            raise RuntimeError("Cursor is closed")
+            
+        # Delegate to sync cursor which handles the procedure call logic
+        return self._sync_cursor.callproc(procname, args)
+    
+    async def nextset(self) -> 'AsyncSnowflakeCursor | None':
+        """
+        Fetch the next set of results for multi-statement queries.
+        
+        Async version of: SnowflakeCursor.nextset()
+        
+        Returns:
+            Self if more results available, None otherwise
+        """
+        if self._is_closed:
+            raise RuntimeError("Cursor is closed")
+            
+        # Use sync cursor's multi-statement logic
+        result = self._sync_cursor.nextset()
+        if result is not None:
+            # Convert any new sync result set to async
+            if hasattr(self._sync_cursor, '_result_set') and self._sync_cursor._result_set:
+                # Create async result set from updated sync cursor state
+                self._async_result_set = self._create_async_result_set_from_sync()
+            return self
+        return None
+    
+    def _create_async_result_set_from_sync(self) -> AsyncResultSet:
+        """Create async result set from current sync cursor state."""
+        if not self._sync_cursor._result_set:
+            return None
+            
+        # Convert sync result batches to async ones
+        async_batches = []
+        for sync_batch in self._sync_cursor._result_set.batches:
+            if hasattr(sync_batch, 'column_converters'):
+                # JSON batch
+                async_batch = AsyncJSONResultBatch(
+                    sync_batch.rowcount,
+                    sync_batch._chunk_headers,
+                    sync_batch._remote_chunk_info,
+                    sync_batch._schema,
+                    sync_batch.column_converters,
+                    sync_batch._use_dict_result,
+                    json_result_force_utf8_decoding=getattr(sync_batch, '_json_result_force_utf8_decoding', False)
+                )
+            else:
+                # Arrow batch
+                async_batch = AsyncArrowResultBatch(
+                    sync_batch.rowcount,
+                    sync_batch._chunk_headers,
+                    sync_batch._remote_chunk_info,
+                    sync_batch._context,
+                    sync_batch._use_dict_result,
+                    sync_batch._numpy,
+                    sync_batch._schema,
+                    sync_batch._number_to_decimal,
+                )
+            
+            # Copy local data if available
+            if sync_batch._local and sync_batch._data:
+                async_batch._data = sync_batch._data
+                
+            async_batches.append(async_batch)
+        
+        return AsyncResultSet(
+            self,
+            async_batches,
+            self._sync_cursor._result_set.prefetch_thread_num,
+            self._sync_cursor._result_set._use_mp
+        )
+
     async def close(self) -> None:
         """
         Close the cursor.
@@ -442,6 +545,55 @@ class AsyncSnowflakeCursor:
     def arraysize(self, value: int) -> None:
         """Set arraysize."""
         self._sync_cursor.arraysize = value
+    
+    @property
+    def lastrowid(self) -> Optional[int]:
+        """Last row ID (DB-API 2.0 compliance)."""
+        return getattr(self._sync_cursor, 'lastrowid', None)
+    
+    @property
+    def timestamp_output_format(self) -> Optional[str]:
+        """Timestamp output format.""" 
+        return getattr(self._sync_cursor, 'timestamp_output_format', None)
+    
+    @timestamp_output_format.setter
+    def timestamp_output_format(self, value: str) -> None:
+        """Set timestamp output format."""
+        if hasattr(self._sync_cursor, 'timestamp_output_format'):
+            self._sync_cursor.timestamp_output_format = value
+    
+    @property
+    def date_output_format(self) -> Optional[str]:
+        """Date output format."""
+        return getattr(self._sync_cursor, 'date_output_format', None)
+    
+    @date_output_format.setter  
+    def date_output_format(self, value: str) -> None:
+        """Set date output format."""
+        if hasattr(self._sync_cursor, 'date_output_format'):
+            self._sync_cursor.date_output_format = value
+    
+    @property
+    def time_output_format(self) -> Optional[str]:
+        """Time output format."""
+        return getattr(self._sync_cursor, 'time_output_format', None)
+    
+    @time_output_format.setter
+    def time_output_format(self, value: str) -> None:
+        """Set time output format."""
+        if hasattr(self._sync_cursor, 'time_output_format'):
+            self._sync_cursor.time_output_format = value
+    
+    @property
+    def timezone(self) -> Optional[str]:
+        """Timezone setting."""
+        return getattr(self._sync_cursor, 'timezone', None)
+    
+    @timezone.setter
+    def timezone(self, value: str) -> None:
+        """Set timezone."""
+        if hasattr(self._sync_cursor, 'timezone'):
+            self._sync_cursor.timezone = value
         
     @property
     def connection(self) -> AsyncSnowflakeConnection:
