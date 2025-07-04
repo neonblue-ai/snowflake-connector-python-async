@@ -736,6 +736,259 @@ The async connector has been thoroughly tested for data consistency:
    - No manual synchronization of business logic required
    - Perfect alignment maintained through composition
 
+## Transaction Mechanisms: How Snowflake Maintains State Across HTTP Requests
+
+### Understanding Transaction Architecture
+
+Unlike traditional database connections that use persistent TCP connections, Snowflake uses a **session-based transaction model** over HTTP REST API calls. This is a critical architectural concept that enables ACID transactions to span multiple HTTP requests.
+
+#### Session-Based State Management
+
+**The fundamental insight:** Snowflake maintains transaction state server-side using **session tokens**, not persistent connections.
+
+```python
+# Each of these HTTP requests shares the same session token:
+await cursor.execute("BEGIN")                    # POST to /queries/v1/query-request
+await cursor.execute("INSERT INTO t VALUES (1)")  # POST to /queries/v1/query-request  
+await cursor.execute("INSERT INTO t VALUES (2)")  # POST to /queries/v1/query-request
+await cursor.execute("COMMIT")                   # POST to /queries/v1/query-request
+# All requests include: Authorization: Snowflake Token="<session_token>"
+```
+
+### Session Establishment and Token Management
+
+#### 1. Authentication Flow
+```
+Client → POST /session/v1/login-request → Snowflake Server
+       ← Session Token + Master Token + Session ID ←
+```
+
+**Response contains:**
+- **Session Token**: Authenticates all subsequent queries
+- **Master Token**: Used for session renewal when session expires  
+- **Session ID**: Server-side identifier for transaction state
+
+#### 2. Query Execution with Session Context
+```
+Client → POST /queries/v1/query-request → Snowflake Server
+         Headers: Authorization: Snowflake Token="<token>"
+         Body: {"sqlText": "INSERT INTO...", "sequenceId": 123}
+       ← Query Results ←
+```
+
+**Critical components:**
+- **Session Token in Header**: Links request to server-side session
+- **Sequence Counter**: Ensures query ordering within session
+- **Query Context DTO**: Contains session state and parameters
+
+#### 3. Session Keep-Alive
+```
+Client → POST /session/heartbeat → Snowflake Server
+         Headers: Authorization: Snowflake Token="<token>"
+       ← {"success": true} ←
+```
+
+### Transaction State Persistence Mechanisms
+
+#### Server-Side Session Storage
+```python
+# Session State (maintained server-side):
+{
+    "session_id": "01234567-89ab-cdef-0123-456789abcdef",
+    "transaction_state": {
+        "autocommit": false,
+        "isolation_level": "READ_COMMITTED", 
+        "active_transaction": true,
+        "transaction_id": "98765432-1fed-cba9-8765-432109876543"
+    },
+    "connection_params": {
+        "database": "mydb",
+        "schema": "myschema", 
+        "warehouse": "mywh",
+        "role": "myrole"
+    }
+}
+```
+
+#### Autocommit Mode Control
+```python
+# Setting autocommit affects subsequent statements in the session:
+await cursor.execute("ALTER SESSION SET autocommit=false")  # Starts manual transactions
+await cursor.execute("INSERT INTO table VALUES (1)")        # Part of transaction
+await cursor.execute("INSERT INTO table VALUES (2)")        # Part of same transaction  
+await cursor.execute("COMMIT")                              # Commits both inserts
+
+# Server maintains transaction boundary across HTTP requests
+```
+
+### Transaction Isolation Implementation
+
+#### Cross-Session Isolation Test
+```python
+# Connection 1: Start transaction
+conn1 = await snowflake.connector.aio.connect(**params)
+cursor1 = conn1.cursor()
+await cursor1.execute("BEGIN")
+await cursor1.execute("INSERT INTO test VALUES (1)")  # Uncommitted
+
+# Connection 2: Different session, cannot see uncommitted data
+conn2 = await snowflake.connector.aio.connect(**params)  # Different session token
+cursor2 = conn2.cursor()
+await cursor2.execute("SELECT COUNT(*) FROM test")       # Returns old count
+
+# The server isolates transactions by session token
+```
+
+#### Session Token Isolation
+```
+Session A Token: "abc123..."  →  Transaction State A (has uncommitted INSERT)
+Session B Token: "xyz789..."  →  Transaction State B (clean state)
+```
+
+### Sync vs Async Transaction Implementation
+
+#### Identical Session Management
+Both sync and async implementations use **identical session token mechanisms**:
+
+| Component | Sync Implementation | Async Implementation | Mechanism |
+|-----------|-------------------|---------------------|-----------|
+| **Authentication** | `requests.post()` to `/session/v1/login-request` | `aiohttp.post()` to `/session/v1/login-request` | Same token response processing |
+| **Query Execution** | `requests.post()` to `/queries/v1/query-request` | `aiohttp.post()` to `/queries/v1/query-request` | Same session token in headers |
+| **Session State** | Stored in `SnowflakeRestful._token` | Stored in `AsyncSnowflakeRestful._token` | Same token management logic |
+| **Heartbeat** | `threading.Timer` → `requests.post()` | `asyncio.create_task()` → `aiohttp.post()` | Same session validation |
+
+#### Token Lifecycle Management
+```python
+# Both sync and async follow identical patterns:
+
+# 1. Authentication
+auth_response = await session.post('/session/v1/login-request', json=auth_data)
+self._token = auth_response['data']['token']
+self._master_token = auth_response['data']['masterToken'] 
+self._session_id = auth_response['data']['sessionId']
+
+# 2. Query execution with session context
+headers = {"Authorization": f"Snowflake Token=\"{self._token}\""}
+query_response = await session.post('/queries/v1/query-request', 
+                                  json=query_data, headers=headers)
+
+# 3. Session renewal when needed
+if query_response.status == 390112:  # Session expired
+    await self._renew_session_with_master_token()
+```
+
+### Transaction Validation: Comprehensive Testing
+
+#### Enhanced Isolation Testing
+Our transaction benchmark validates proper isolation across sessions:
+
+```python
+async def test_transaction_isolation():
+    # Connection 1: Create uncommitted changes
+    conn1 = await AsyncSnowflakeConnection.connect(**params)
+    await conn1.autocommit(False)
+    cursor1 = conn1.cursor()
+    await cursor1.execute("INSERT INTO test VALUES (400, 'uncommitted')")
+    
+    # Verify data visible in same session
+    await cursor1.execute("SELECT * FROM test WHERE id = 400")
+    same_session_data = await cursor1.fetchall()  # Returns: [(400, 'uncommitted')]
+    
+    # Connection 2: Different session should NOT see uncommitted data
+    conn2 = await AsyncSnowflakeConnection.connect(**params)  # New session token
+    cursor2 = conn2.cursor()
+    await cursor2.execute("SELECT * FROM test WHERE id = 400")
+    other_session_data = await cursor2.fetchall()  # Returns: [] (empty)
+    
+    # Validation
+    assert len(same_session_data) == 1      # Visible in same session
+    assert len(other_session_data) == 0     # Invisible in other session
+    
+    # Rollback in session 1
+    await conn1.rollback()
+    await cursor1.execute("SELECT * FROM test WHERE id = 400")  
+    after_rollback = await cursor1.fetchall()  # Returns: [] (rolled back)
+```
+
+#### Test Results: Perfect Transaction Isolation
+```
+🔍 Test 4: Transaction Isolation
+  Sync:  in_txn=9, other_conn=6, isolated=True
+         uncommitted visible same_conn=3, other_conn=0
+  Async: in_txn=9, other_conn=6, isolated=True
+         uncommitted visible same_conn=3, other_conn=0
+  ✅ MATCH
+```
+
+**Validation confirms:**
+- ✅ **Uncommitted data visible in same session**: 3 rows (expected)
+- ✅ **Uncommitted data invisible to other session**: 0 rows (proper isolation)  
+- ✅ **Identical behavior**: Sync and async implementations perfectly aligned
+
+### Key Architectural Insights
+
+#### 1. Stateless HTTP, Stateful Sessions
+- **HTTP Layer**: Each request is stateless
+- **Session Layer**: Server maintains transaction state per session token
+- **Transaction Boundaries**: Controlled by SQL commands (`BEGIN`, `COMMIT`, `ROLLBACK`) within session
+
+#### 2. Token-Based Authentication Security
+- **Session Tokens**: Short-lived, query-specific authentication
+- **Master Tokens**: Longer-lived, used for session renewal
+- **Automatic Renewal**: Transparent session extension without re-authentication
+
+#### 3. Transaction Persistence Across Requests
+```python
+# Each arrow represents a separate HTTP request with same session token:
+await cursor.execute("BEGIN")        # ← HTTP Request 1: Start transaction
+await cursor.execute("INSERT...")    # ← HTTP Request 2: Add to transaction  
+await cursor.execute("UPDATE...")    # ← HTTP Request 3: Add to transaction
+await cursor.execute("COMMIT")       # ← HTTP Request 4: Commit all changes
+
+# Server maintains transaction state across all 4 HTTP requests using session token
+```
+
+#### 4. Autocommit Mode Effects
+```python
+# Autocommit ON: Each statement is auto-committed
+await conn.autocommit(True)
+await cursor.execute("INSERT...")  # Automatically committed
+await cursor.execute("UPDATE...")  # Automatically committed
+
+# Autocommit OFF: Manual transaction control
+await conn.autocommit(False) 
+await cursor.execute("INSERT...")  # Part of transaction
+await cursor.execute("UPDATE...")  # Part of same transaction
+await conn.commit()                # Commit both operations
+```
+
+### Implementation Verification
+
+#### Session Token Consistency
+Both sync and async implementations ensure:
+- ✅ **Same session establishment flow**
+- ✅ **Identical token management** 
+- ✅ **Same query context passing**
+- ✅ **Identical error handling for session expiry**
+
+#### Transaction Semantics Validation
+Comprehensive testing confirms:
+- ✅ **ACID properties maintained** across HTTP requests
+- ✅ **Isolation levels enforced** server-side by session
+- ✅ **Autocommit behavior identical** between sync/async
+- ✅ **Error conditions handled consistently**
+
+### Conclusion: HTTP-Based ACID Transactions
+
+Snowflake's innovative architecture proves that **ACID transactions can work reliably over HTTP REST APIs** through:
+
+1. **Session-based state management** instead of persistent connections
+2. **Token-based authentication** linking requests to server-side transaction state  
+3. **Sequence counters** ensuring proper query ordering
+4. **Automatic session renewal** providing transparent long-running transaction support
+
+This architecture enables the async connector to provide **identical transaction semantics** to the sync connector while delivering **significant performance improvements** through non-blocking I/O operations.
+
 ## When to Use Each Connector
 
 ### Use Async Connector When:
