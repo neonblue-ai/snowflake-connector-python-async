@@ -11,13 +11,16 @@ from __future__ import annotations
 import uuid
 import weakref
 from logging import getLogger
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .. import SnowflakeConnection
 from ..cursor import SnowflakeCursor
 from ..time_util import get_time_millis
 from .network import AsyncSnowflakeRestful
 from .time_util import AsyncHeartBeatTimer, create_weak_async_heartbeat_func
+
+if TYPE_CHECKING:
+    from .cursor import AsyncSnowflakeCursor
 
 logger = getLogger(__name__)
 
