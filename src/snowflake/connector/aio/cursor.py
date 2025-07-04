@@ -418,14 +418,17 @@ class AsyncSnowflakeCursor:
         if self._is_closed:
             raise RuntimeError("Cursor is closed")
             
-        # Delegate to sync cursor which handles the procedure call logic
-        return self._sync_cursor.callproc(procname, args)
+        # Use async execute to call the stored procedure (same logic as sync version)
+        marker_format = "%s" if self._async_connection._sync_connection.is_pyformat else "?"
+        command = f"CALL {procname}({', '.join([marker_format for _ in range(len(args))])})"
+        await self.execute(command, args)
+        return args
     
-    async def nextset(self) -> 'AsyncSnowflakeCursor | None':
+    def nextset(self) -> 'AsyncSnowflakeCursor | None':
         """
         Fetch the next set of results for multi-statement queries.
         
-        Async version of: SnowflakeCursor.nextset()
+        Delegates to: SnowflakeCursor.nextset()
         
         Returns:
             Self if more results available, None otherwise
@@ -488,11 +491,11 @@ class AsyncSnowflakeCursor:
             self._sync_cursor._result_set._use_mp
         )
 
-    async def close(self) -> None:
+    def close(self) -> None:
         """
         Close the cursor.
         
-        Async version of: SnowflakeCursor.close()
+        Delegates to: SnowflakeCursor.close()
         """
         self._sync_cursor.close()
         self._is_closed = True
