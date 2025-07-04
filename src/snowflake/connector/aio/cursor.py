@@ -611,13 +611,64 @@ class AsyncSnowflakeCursor:
         """String representation of async cursor."""
         return f"<AsyncSnowflakeCursor(closed={self._is_closed})>"
         
-    # Async iteration support (future enhancement)
-    def __aiter__(self):
-        """Async iterator support."""
+    # Context manager support
+    def __enter__(self) -> 'AsyncSnowflakeCursor':
+        """Context manager entry.
+        
+        Same as: SnowflakeCursor.__enter__()
+        
+        Returns:
+            Self for use in with statements
+        """
         return self
         
-    async def __anext__(self):
-        """Async iteration."""
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object | None,
+    ) -> None:
+        """Context manager exit with cleanup.
+        
+        Same as: SnowflakeCursor.__exit__()
+        
+        Args:
+            exc_type: Exception type if an exception occurred
+            exc_val: Exception value if an exception occurred  
+            exc_tb: Exception traceback if an exception occurred
+        """
+        self.close()
+        
+    # Async iteration support
+    def __aiter__(self) -> 'AsyncSnowflakeCursor':
+        """
+        Async iterator support.
+        
+        Provides async iteration over result rows using the async iterator protocol.
+        Use with 'async for' statements.
+        
+        Returns:
+            Self as async iterator
+            
+        Example:
+            async for row in cursor:
+                print(row)
+        """
+        return self
+        
+    async def __anext__(self) -> tuple | dict:
+        """
+        Async iterator next method.
+        
+        Fetches the next row using async fetchone(). Raises StopAsyncIteration
+        when no more rows are available.
+        
+        Returns:
+            Next row as tuple or dict
+            
+        Raises:
+            StopAsyncIteration: When no more rows are available
+        """
         row = await self.fetchone()
         if row is None:
             raise StopAsyncIteration
