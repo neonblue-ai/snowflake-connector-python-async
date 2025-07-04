@@ -114,6 +114,10 @@ class AsyncSnowflakeCursor:
         else:
             self._async_result_set = None
         
+        # Reset async iterator for new query execution
+        if hasattr(self, '_async_iterator'):
+            delattr(self, '_async_iterator')
+        
         return self
 
     def _create_async_result_set(self, data: dict[str, Any]) -> None:

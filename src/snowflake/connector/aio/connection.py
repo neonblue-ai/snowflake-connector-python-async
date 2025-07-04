@@ -8,13 +8,16 @@ all business logic from the base library.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
+import warnings
 import weakref
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, Optional
 
 from .. import SnowflakeConnection
 from ..cursor import SnowflakeCursor
+from ..errors import Error
 from ..time_util import get_time_millis
 from .network import AsyncSnowflakeRestful
 from .time_util import AsyncHeartBeatTimer, create_weak_async_heartbeat_func
@@ -143,8 +146,49 @@ class AsyncSnowflakeConnection:
         Args:
             mode: True to enable autocommit, False to disable
         """
-        # Delegate to sync connection for consistency
-        self._sync_connection.autocommit(mode)
+        if not self._async_rest_client:
+            # Use same error handling as sync version
+            from ..errors import Error, DatabaseError
+            from ..errorcode import ER_CONNECTION_IS_CLOSED
+            from ..sqlstate import SQLSTATE_CONNECTION_NOT_EXISTS
+            Error.errorhandler_wrapper(
+                self._sync_connection,
+                None,
+                DatabaseError,
+                {
+                    "msg": "Connection is closed",
+                    "errno": ER_CONNECTION_IS_CLOSED,
+                    "sqlstate": SQLSTATE_CONNECTION_NOT_EXISTS,
+                },
+            )
+        
+        if not isinstance(mode, bool):
+            from ..errors import Error, ProgrammingError
+            from ..errorcode import ER_INVALID_VALUE
+            Error.errorhandler_wrapper(
+                self._sync_connection,
+                None,
+                ProgrammingError,
+                {
+                    "msg": f"Invalid parameter: {mode}",
+                    "errno": ER_INVALID_VALUE,
+                },
+            )
+        
+        # Execute autocommit setting through async cursor like sync version
+        try:
+            cursor = self.cursor()
+            await cursor.execute(f"ALTER SESSION SET autocommit={mode}")
+        except Error as e:
+            # Handle special case like sync version
+            from ..sqlstate import SQLSTATE_FEATURE_NOT_SUPPORTED
+            if e.sqlstate == SQLSTATE_FEATURE_NOT_SUPPORTED:
+                logger.debug(
+                    "Autocommit feature is not enabled for this connection. Ignored"
+                )
+            else:
+                # Re-raise other errors
+                raise e
     
     async def execute_string(
         self, 
@@ -211,7 +255,7 @@ class AsyncSnowflakeConnection:
         
     async def close(self) -> None:
         """
-        Close async connection and cleanup resources.
+        Close async connection and cleanup resources gracefully.
         
         Async version of: SnowflakeConnection.close()
         """
@@ -220,6 +264,8 @@ class AsyncSnowflakeConnection:
         
         if self._async_rest_client:
             await self._async_rest_client.close()
+            # Allow underlying connections to close (aiohttp best practice)
+            await asyncio.sleep(0)
             self._async_rest_client = None
             
         # Close sync connection
@@ -402,3 +448,17 @@ class AsyncSnowflakeConnection:
     def __repr__(self) -> str:
         """String representation of async connection."""
         return f"<AsyncSnowflakeConnection(user='{self.user}', account='{self.account}', database='{self.database}')>"
+        
+    def __del__(self) -> None:
+        """Warn about unclosed connections to educate users."""
+        if (self._async_rest_client and 
+            hasattr(self._async_rest_client, '_session') and
+            self._async_rest_client._session and 
+            not self._async_rest_client._session.closed):
+            
+            warnings.warn(
+                "AsyncSnowflakeConnection was not properly closed. "
+                "Use 'await connection.close()' to avoid resource leaks.",
+                ResourceWarning,
+                stacklevel=2
+            )

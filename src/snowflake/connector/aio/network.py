@@ -7,6 +7,7 @@ HTTP client with aiohttp while reusing all business logic from the sync network 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from logging import getLogger
@@ -287,7 +288,7 @@ class AsyncSnowflakeRestful:
                 
                 # Process result using sync connection logic if needed
                 if not result.get("success"):
-                    error_code = result.get("code", -1)
+                    error_code = int(result.get("code", -1))
                     error_message = result.get("message", "Unknown error")
                     
                     # Use sync error handling logic for consistency
@@ -297,13 +298,19 @@ class AsyncSnowflakeRestful:
                         "sqlstate": result.get("sqlstate"),
                     }
                     
-                    # Raise appropriate exception type based on error
+                    # Use sync error handler pattern for consistency
                     if error_code >= 600000:  # Internal errors
-                        raise InterfaceError(error_data)
+                        Error.errorhandler_wrapper(
+                            self._sync_connection, None, InterfaceError, error_data
+                        )
                     elif error_code >= 400000:  # Client errors  
-                        raise ProgrammingError(error_data)
+                        Error.errorhandler_wrapper(
+                            self._sync_connection, None, ProgrammingError, error_data
+                        )
                     else:  # General database errors
-                        raise DatabaseError(error_data)
+                        Error.errorhandler_wrapper(
+                            self._sync_connection, None, DatabaseError, error_data
+                        )
                     
                 return result
         
@@ -370,7 +377,9 @@ class AsyncSnowflakeRestful:
             return {"success": False, "message": str(e)}
 
     async def close(self) -> None:
-        """Close async HTTP session."""
-        if self._session:
+        """Close async HTTP session gracefully."""
+        if self._session and not self._session.closed:
             await self._session.close()
+            # Allow underlying connections to close (aiohttp best practice)
+            await asyncio.sleep(0)
             self._session = None
